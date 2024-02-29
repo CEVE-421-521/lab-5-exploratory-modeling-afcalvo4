@@ -1,14 +1,12 @@
 ---
 title: "Lab 5: Sea-Level Rise"
-author: "<Your Name (NetID)>"
+author: "Andres Calvo (ac228)"
 jupyter: julia-1.10
 date: 2024-02-16
 
 format: 
     html: default
 
-    # YOU DO NOT NEED BOTH PDF AND DOCX.
-    # COMMENT OR DELETE THE ONE YOU DON'T WANT TO USE.
     pdf:
         documentclass: article
         fontsize: 11pt
@@ -16,30 +14,10 @@ format:
             - margin=1in  
         number-sections: true
         code-line-numbers: true
-    #docx: 
-    #    toc: true
-    #    fig-format: png
-    #    number-sections: true
-    #    code-line-numbers: true
 
 date-format: "ddd., MMM. D"
 bibliography: references.bib
 ---
-
-# Setup
-
-## The usual
-
-As always:
-
-1. Clone the lab repository to your computer
-1. Open the lab repository in VS Code
-1. Open the Julia REPL and activate, then instantiate, the lab environment
-1. Make sure you can render: `quarto render template.qmd` in the terminal.
-    - If you run into issues, try running `] build IJulia` in the Julia REPL (`]` enters the package manager).
-    - If you still have issues, try opening up `blankfile.py`. That should trigger VS Code to give you the option to install the Python extension, which you should do. Then you should be able to open a menu in the bottom right of your screen to select which Python installation you want VS Code to use.
-
-
 ## Load packages
 
 ```{julia}
@@ -54,9 +32,560 @@ using Unitful
 Plots.default(; margin=5Plots.mm)
 ```
 
-## Local package
+### Local package
 
 ```{julia}
 using Revise
 using HouseElevation
 ```
+
+## Building object
+The information from previous labs is integrated in a `Building` object with the following parameters:
+
+Area
+: 33 000 ft^2^
+
+Offset from gauge
+: 6 ft
+
+Valuation
+: 5'445 000 USD (*Structure + Contents*)
+
+Offset (measure from gauge)
+: 6 ft
+
+```{julia}
+#| output: false
+offset = 6
+building = let
+    haz_fl_dept = CSV.read("data/haz_fl_dept.csv",DataFrame)
+    desc = "Average Light Industrial, Contents (Equipment/Inventory)"
+    row = @rsubset(haz_fl_dept, :Description == desc)[1,:]
+    area = 33000u"ft^2"
+    height_above_gauge = (offset)u"ft"
+    House(
+        row;
+        area = area,
+        height_above_gauge = height_above_gauge,
+        value_usd = 5_445_000,
+        )
+end
+```
+### Building Depth-Damage function
+The following Depth-Damage function (DDF) is use from the USACI-Galveston data for light industrial buildings 
+```{julia}
+#| code-fold: true
+let
+    depths = uconvert.(u"ft", (-7.0u"ft"):(1.0u"inch"):(30.0u"ft"))
+    damages = building.ddf.(depths) ./ 100
+    damages_1e6_usd = damages .* building.value_usd ./ 1e6
+    plot(
+        depths,
+        damages_1e6_usd;
+        xlabel = "Flood Depth",
+        ylabel = "Damage (Millions USD)",
+        ylims = [0,trunc(maximum(damages_1e6_usd)) + 1],
+        label = "$(building.description)\n($(building.source))",
+        legend = :outerbottom,
+        size = (500, 400),
+        yformatter=:plain, # prevents scientific notation
+        color = "orangered",
+        linewidth = 3,
+    )
+end
+```
+### Building Elevation cost function
+The elevation costs considered are the following for every elevation:
+```{julia}
+#| code-fold: true
+let
+    elevations = 0u"ft":0.25u"ft":14u"ft"
+    costs = [elevation_cost(building, eᵢ) for eᵢ in elevations]
+    plot(
+        elevations,
+        costs ./ 1e6;
+        xlabel="Elevation",
+        ylabel="Cost (Millions USD)",
+        ylims = [0,trunc(maximum(costs ./ 1e6)) + 1],
+        label="$(building.description)\n($(building.source))",
+        legend=:outerbottom,
+        size=(500, 400),
+        yformatter=:plain, # prevents scientific notation
+        color = "dodgerblue4",
+        linewidth = 3,
+        )
+end
+```
+### Sea-level rise model
+The Sea-level rise (SLR) is adapted from @oddo_coastal:2017
+```{julia}
+slr_scenarios = let
+    df = CSV.read("data/slr_oddo.csv", DataFrame)
+    [Oddo17SLR(a, b, c, tstar, cstar) for (a, b, c, tstar, cstar) in eachrow(df)]
+end
+println("There are $(length(slr_scenarios)) parameter sets")
+```
+The following are 300 random samples (realizations) using the model. The average trend of these simulations is also included.
+```{julia}
+#| code-fold: true
+let 
+    years = 1900:2150
+    p = plot(;
+             xlabel = "Year",
+             ylabel = "Mean sea-level (ft)\nwith respect to the year 2000",
+             label = "Oddo et al. (2017)",
+             legend = :topleft,
+             size=(500, 400),)
+    s_average = years.*0
+    for s in rand(slr_scenarios,300)
+        plot!(p,
+              years,
+              s.(years);
+              palette = :oslo,
+              alpha = 0.5,
+              linewidth = 0.5,
+              label = nothing,
+              )
+        s_average +=  s.(years)
+    end
+    s_average /= 300
+    plot!(years,
+          s_average;
+          ylims = [-1,15],
+          color = "orangered",
+          label = "Average",
+          linewidth = 2,
+          )
+    p
+end
+```
+### Storm surge hazard model
+A General Extreme Value (GEV) distribution for the gauge is selected to represent the flood hazard, that is, the flood depth intensity probability. The following are the distribution parameters (μ, σ and ξ) that can be randomly sampled from normal distributions around average values. The plot shows 100 random realizations and the based distribution for the gauge and for the building (subtracting the offset height).
+```{julia}
+#| code-fold: true
+function draw_surge_distribution()
+    μ = rand(Normal(5, 1))
+    σ = rand(truncated(Normal(1.5,0.5),0,Inf))
+    ξ = rand(Normal(0.1, 0.05))
+    GeneralizedExtremeValue(μ, σ, ξ)
+end
+let
+    p = plot(;
+        xlabel = "Water Level (ft)",
+        ylabel = "Probability Density",
+        xlims = [-10,20],
+        ylims = [0,1],
+        size=(500, 400),
+        )
+    plot!(p,
+          [draw_surge_distribution() for _ in 1:100];
+          palette = :lajolla,
+          linewidth = 0.5,
+          alpha = 0.6,
+          label = nothing,
+          )
+    plot!(p,
+          GeneralizedExtremeValue(5, 1.5, 0.1);
+          color = "orangered",
+          linewidth = 3,
+          label = "Base distribution: Gauge",
+          legend = :outerbottom,
+          )
+    plot!(p,
+          GeneralizedExtremeValue(5-offset, 1.5, 0.1);
+          color = "Teal",
+          linewidth = 3,
+          label = "Base distribution: Building",
+          legend = :outerbottom,
+          )
+end
+```
+### Discount rate
+The discount rate is generated following normal distributions with a mean value of 5%. This higher value could be appropriate for industrial stakeholders (even larger) considering that their cost of opportunity can be higher than those for house holders.
+
+```{julia}
+#| code-fold: true
+function draw_discount_rate()
+    return rand(truncated(Normal(0.05, 0.025),0,Inf))
+end
+let
+    p = plot(truncated(Normal(0.05, 0.025),0,Inf);
+             xlabel = "Discount rate",
+             ylabel = "Probability Density",
+             ylims = [0,20],
+             xlims = [0,0.15],
+             color = "teal",
+             linewidth = 3,
+             label = "Discount rate - Normal",
+             legend = :outerbottom,
+             )
+end
+```
+
+### Simulations
+The following is an example simulation considering a 50-year time window and random realizations of the hazard distribution, discount rate and SLR model. The action is elevating the building by 3 ft.
+```{julia}
+let
+    p = ModelParams(
+        house = building,
+        years = 2024:2034
+    )
+
+    sow = SOW(
+        rand(slr_scenarios),
+        draw_surge_distribution(),
+        draw_discount_rate()
+    )
+
+    a = Action(3.0u"ft")
+
+    res = run_sim(a, sow, p)/1e6
+
+    print("The NPV cost for the action a = 3 ft and a realization of the SOW is \n $(round(res,digits = 2)) USD Millions")
+end
+```
+### Exploratory modeling
+The actions correspond to incremental elevation heights:
+Actions $a$
+: [0: 1: 14] ft
+
+There is no elevation cost above 14 ft and would be more than one-story elevation. For each action, 100 SOWs are going to be considered to form the “*large ensemble*”. Inside the functions, there are 10000 Monte Carlo Sampling realizations.
+
+```{julia}
+#| output: false
+df = let
+    action_scheme = 0:1:14
+    time_frame = [25,50,100]
+    realizations = 100
+    simulations = 0
+    for t in 1:size(time_frame)[1]
+        for e in 1:size(action_scheme)[1]
+            p = ModelParams(
+                            house = building,
+                            years = 2024:(2024 + time_frame[t])
+                            )
+
+            sows = [SOW(rand(slr_scenarios),
+                        draw_surge_distribution(),
+                        draw_discount_rate())
+                    for _ in 1:realizations]
+            
+            actions = [Action((action_scheme[e])u"ft") for _ in 1:realizations]
+
+            results = [run_sim(a, s, p) for (a, s) in zip(actions, sows)]
+
+            if t == 1 && e == 1
+                simulations = DataFrame(
+                        npv = results,
+                        Δh_ft = [a.Δh_ft for a in actions],
+                        slr_a = [s.slr.a for s in sows],
+                        slr_b = [s.slr.b for s in sows],
+                        slr_c = [s.slr.c for s in sows],
+                        slr_tstar = [s.slr.tstar for s in sows],
+                        slr_cstar = [s.slr.cstar for s in sows],
+                        surge_μ = [s.surge_dist.μ for s in sows],
+                        surge_σ = [s.surge_dist.σ for s in sows],
+                        surge_ξ = [s.surge_dist.ξ for s in sows],
+                        discount_rate = [s.discount_rate for s in sows],
+                        years_frame = time_frame[t])
+            else
+                for r_i in 1:realizations
+                    push!(simulations,[results[r_i],
+                            [a.Δh_ft for a in actions][r_i],
+                            [s.slr.a for s in sows][r_i],
+                            [s.slr.b for s in sows][r_i],
+                            [s.slr.c for s in sows][r_i],
+                            [s.slr.tstar for s in sows][r_i],
+                            [s.slr.cstar for s in sows][r_i],
+                            [s.surge_dist.μ for s in sows][r_i],
+                            [s.surge_dist.σ for s in sows][r_i],
+                            [s.surge_dist.ξ for s in sows][r_i],
+                            [s.discount_rate for s in sows][r_i],
+                            time_frame[t]])
+                end
+            end
+        end
+    end
+    simulations
+end
+```
+The following are some general statistics of the resulting from the simulations:
+
+### 25 year life-span
+```{julia}
+describe(df[df.years_frame .== 25,[1,3,6,7,8,9,11]])
+```
+### 50 year life-span
+```{julia}
+describe(df[df.years_frame .== 50,[1,3,6,7,8,9,11]])
+```
+### 100 year life-span
+```{julia}
+describe(df[df.years_frame .== 100,[1,3,6,7,8,9,11]])
+```
+### Multi-year NPV averages
+
+The following are the statistics of NPV results for
+Actions $a$
+: [0,2,4,6,8,10,12,14] ft
+```{julia}
+let
+    df_stats = DataFrame(a0 = df.npv[(df.Δh_ft .== 0)]./-1e6,
+                         a2 = df.npv[(df.Δh_ft .== 2)]./-1e6,
+                         a4 = df.npv[(df.Δh_ft .== 4)]./-1e6,
+                         a6 = df.npv[(df.Δh_ft .== 6)]./-1e6,
+                         a8 = df.npv[(df.Δh_ft .== 8)]./-1e6,
+                         a10 = df.npv[(df.Δh_ft .== 10)]./-1e6,
+                         a12 = df.npv[(df.Δh_ft .== 12)]./-1e6,)
+    describe(df_stats)
+end
+```
+The results can also be visualized for every action and their corresponding statistics. For example, the following is the NPV of the cost for all 25-, 50- and 100-year lifespans. It can be concluded that for the modeled SOW's the large majority shows that elevating the building led to lower NPVs.
+```{julia}
+#| code-fold: true
+action_scheme = 0:1:14
+let
+    p = plot(;
+             xlabel = "Building Elevation (ft)",
+             ylabel = "Present Net Value (Million USD)",
+             ylims = [0,trunc(quantile(-df.npv ./ 1e6,0.99)) + 5],
+             xticks = 0:1:14,
+             legend = :topright,
+             size=(500, 400),)
+
+    quan = [0.05,0.25,0.50,0.75,0.95]
+    statistic =  ones(size(action_scheme)[1],1)
+    for q in 1:size(quan)[1]
+        for e in 1:size(action_scheme)[1]
+            statistic[e,1] = quantile(df.npv[(df.Δh_ft .== action_scheme[e])],quan[q])
+        end
+            
+        plot!(p,
+            action_scheme,
+            -statistic / 1e6;
+            label = "Q: $(quan[q])",
+            palette = palette([:red, :blue], 5),)
+    end
+    for e in 1:size(action_scheme)[1]
+            statistic[e,1] = mean(df.npv[(df.Δh_ft .== action_scheme[e])])
+    end
+    plot!(p,
+                action_scheme,
+                -statistic / 1e6;
+                label = "Mean",
+                linewidth = 3,
+                color = "teal",)
+    p
+end
+```
+These values can be appreciated using some boxplots for every lifespan. Some conclusions are the following:
+1. The uncertainty grows with the lifespan mainly due to the SRL model that contains large uncertainties for longer timeframes.
+2. From these graphs, it is also evident that the longer lifespan is considered, the NPV grows.
+3. Following the 50% quantile, the is evidence of a convex behavior having a minimum at ~8 ft of elevation
+
+```{julia}
+#| code-fold: true
+let
+    y25 = boxplot(;
+                xlabel="Elevation (ft)",
+                ylabel="Cost (Millions USD)",
+                legend = false,
+                ylims = [0,50],
+                title = "25 years",
+                size=(1000, 400),
+                )
+    for e in 1:size(action_scheme)[1]
+    boxplot!(y25,["$(action_scheme[e])"],
+            -df.npv[(df.Δh_ft .== action_scheme[e]).*(df.years_frame .== 25)]./1e6,
+            color = "teal",
+            )
+    end
+    y50 = boxplot(;
+                xlabel="Elevation (ft)",
+                ylabel="Cost (Millions USD)",
+                legend = false,
+                ylims = [0,50],
+                title = "50 years",
+                )
+    for e in 1:size(action_scheme)[1]
+    boxplot!(["$(action_scheme[e])"],
+            -df.npv[(df.Δh_ft .== action_scheme[e]).*(df.years_frame .== 50)]./1e6,
+            color = "dodgerblue4",
+            )
+    end
+    y100 = boxplot(;
+                xlabel="Elevation (ft)",
+                ylabel="Cost (Millions USD)",
+                legend = false,
+                ylims = [0,50],
+                title = "100 years",
+                )
+    for e in 1:size(action_scheme)[1]
+    boxplot!(["$(action_scheme[e])"],
+            -df.npv[(df.Δh_ft .== action_scheme[e]).*(df.years_frame .== 100)]./1e6,
+            color = "orangered",
+            )
+    end
+    p = plot(y25,y50,y100, layout = (1,3))
+end
+
+```
+**Detail**
+```{julia}
+#| echo: false
+let
+    y25 = boxplot(;
+                xlabel="Elevation (ft)",
+                ylabel="Cost (Millions USD)",
+                legend = false,
+                ylims = [0,10],
+                title = "25 years",
+                size=(1000, 400),
+                )
+    for e in 1:size(action_scheme)[1]
+    boxplot!(y25,["$(action_scheme[e])"],
+            -df.npv[(df.Δh_ft .== action_scheme[e]).*(df.years_frame .== 25)]./1e6,
+            color = "teal",
+            )
+    end
+    y50 = boxplot(;
+                xlabel="Elevation (ft)",
+                ylabel="Cost (Millions USD)",
+                legend = false,
+                ylims = [0,10],
+                title = "50 years",
+                )
+    for e in 1:size(action_scheme)[1]
+    boxplot!(["$(action_scheme[e])"],
+            -df.npv[(df.Δh_ft .== action_scheme[e]).*(df.years_frame .== 50)]./1e6,
+            color = "dodgerblue4",
+            )
+    end
+    y100 = boxplot(;
+                xlabel="Elevation (ft)",
+                ylabel="Cost (Millions USD)",
+                legend = false,
+                ylims = [0,10],
+                title = "100 years",
+                )
+    for e in 1:size(action_scheme)[1]
+    boxplot!(["$(action_scheme[e])"],
+            -df.npv[(df.Δh_ft .== action_scheme[e]).*(df.years_frame .== 100)]./1e6,
+            color = "orangered",
+            )
+    end
+    p = plot(y25,y50,y100, layout = (1,3))
+end
+
+```
+Considering that the highest variability correspond to the action of 0 ft elevation, some analysis can be done to understand the source of these uncertainty and the parameters for which variation the model is more sensible.
+
+### Discount rate
+The discount rate for every analyzed  lifespan has a negative trend where the NPV decreases as the DR grows.
+```{julia}
+#| code-fold: true
+let
+    s = scatter(;
+                xlabel="Discount rate (%)",
+                ylabel="Cost (Millions USD)",
+                ylims = [0,50],
+                xlims = [0,12],
+                title = "No elevation policy",)
+    years = [25,50,100]
+    colors = ["teal","dodgerblue4","orangered"]
+    for y in 1:3
+    scatter!(s,100 .* df.discount_rate[(df.Δh_ft .== 0) .* (df.years_frame .==years[y])],
+            -df.npv[(df.Δh_ft .== 0) .* (df.years_frame .==years[y])]/ 1e6;
+            label = "$(years[y]) years",
+            color = colors[y],
+            )
+    end
+    s
+end
+```
+### Flood frequency
+The higher the location parameter μ of the GEV distribution is the bigger is the NPV. This trend is more evident for shorter lifespans.
+```{julia}
+#| code-fold: true
+let
+    s = scatter(;
+                xlabel="Location parameter μ",
+                ylabel="Cost (Millions USD)",
+                ylims = [0,50],
+                xlims = [2,8],
+                title = "No elevation policy",)
+    years = [25,50,100]
+    colors = ["teal","dodgerblue4","orangered"]
+    for y in 1:3
+    scatter!(s, df.surge_μ[(df.Δh_ft .== 0) .* (df.years_frame .==years[y])],
+            -df.npv[(df.Δh_ft .== 0) .* (df.years_frame .==years[y])]/ 1e6;
+            label = "$(years[y]) years",
+            color = colors[y],
+            )
+    end
+    s
+end
+```
+Simillarly, the shape factor σ, also has a important positive trend.
+```{julia}
+#| code-fold: true
+let
+    s = scatter(;
+                xlabel="Scale parameter σ",
+                ylabel="Cost (Millions USD)",
+                ylims = [0,50],
+                xlims = [0,3],
+                title = "No elevation policy",)
+    years = [25,50,100]
+    colors = ["teal","dodgerblue4","orangered"]
+    for y in 1:3
+    scatter!(s, df.surge_σ[(df.Δh_ft .== 0).* (df.        years_frame .==years[y])],
+            -df.npv[(df.Δh_ft .== 0) .* (df.years_frame .==years[y])]/ 1e6;
+            label = "$(years[y]) years",
+            color = colors[y],
+            )
+    end
+    s
+end
+```
+There is no identifiable trend regarding the SLR model parameters considering perhaps its large variation.
+```{julia}
+#| code-fold: true
+let
+    s = scatter(;
+                xlabel="SRL parameter a",
+                ylabel="Cost (Millions USD)",
+                ylims = [0,50],
+                xlims = [0,60],
+                title = "No elevation policy",
+                )
+    years = [25,50,100]
+    colors = ["teal","dodgerblue4","orangered"]
+    for y in 1:3
+    scatter!(s, df.slr_a[(df.Δh_ft .== 0).* (df.        years_frame .==years[y])],
+            -df.npv[(df.Δh_ft .== 0) .* (df.years_frame .==years[y])]/ 1e6;
+            label = "$(years[y]) years",
+            color = colors[y],
+            )
+    end
+    s
+end
+```
+## Analysis
+**When do you get the best results?**
+
+As previously identified (past lab), the best overall results is around 8 ft of elevation (no important difference in 7-9 ft interval).
+
+**When do you get the worst results?**
+The worst results are concentrated in the 0 and 1 ft elevation actions for all the lifespans considered.
+
+**What are the most important parameters?**
+The flood frequency GEV parameters are very important in the modeling as well as the discount rate. As also shown, the time window considered is also a huge source of both uncertainty and NPV difference.
+
+**If you had unlimited computing power, would you run more simulations? How many?**
+
+I would not run that many simulations considering that the identified trend is already giving good information. The number 1000 or 10000 sounds enough. Similarly, for the present case study the alternative of not-elevating is clearly the one with the worst outcome for any timeframe.
+
+**What are the implications of your results for decision-making?**
+
+The exploratory modeling shows that for the majority of possible SOW, the building is expected to experience major losses if no action is taken. When considering elevating the building, the prevented losses are more important than the elevation costs. From a financial, cost-benefit analysis there are enough arguments to support the elevation project. Regarding the ammount of elevation, there is enough evidence to elevate the bulding ~ 7 ft to reach cost optimallity.
